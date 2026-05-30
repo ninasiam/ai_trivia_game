@@ -118,6 +118,8 @@ def judge_node(state: TriviaState) -> dict:
     # Update score
     if state['user_answer'].strip().lower() == state['correct_answer'].strip().lower():
         is_correct = True
+    else:
+        is_correct = False
     new_score = state['score'] + (1 if is_correct else 0)
 
     print(f"\n Score: {new_score} / {state['total_questions']}")
@@ -126,6 +128,8 @@ def judge_node(state: TriviaState) -> dict:
     again = input("\nNext question? (y/n): ").strip().lower()
     if again != "y":
         game_over = True
+    else:
+        game_over = False
     return {"score": new_score, "game_over": game_over}
 
 # Routing functions
@@ -195,4 +199,4 @@ if __name__ == "__main__":
     # Invocation of the graph
     final_state = app.invoke(initial_state)
     # Final result
-    print(f"\n🏁 Game over! Final score: {final_state['score']}/{final_state['total_questions']}")
+    print(f"\nGame over! Final score: {final_state['score']}/{final_state['total_questions']}")
