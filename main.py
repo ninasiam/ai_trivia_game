@@ -1,5 +1,5 @@
 # ============================================================
-# Slumdog Pythonair Agent — SOLUTION
+# Slumdog Pythonair Agent 
 # ============================================================
 
 from typing import TypedDict
@@ -47,7 +47,6 @@ def setup_node(state: TriviaState) -> dict:
 
 
 def fetch_question_node(state: TriviaState) -> dict:
-    # TODO #1 — SOLUTION
     # Construct the endpoint of open trivia db
     url = f"https://opentdb.com/api.php?amount=1&difficulty={state['difficulty']}&type=multiple"
     response = requests.get(url)
@@ -98,7 +97,6 @@ def present_question_node(state: TriviaState) -> dict:
 
 
 def judge_node(state: TriviaState) -> dict:
-    # TODO #2 — SOLUTION
     prompt = f"""
     Using the following answers:
     The trivia question was: {state['question']}
