@@ -1,11 +1,12 @@
 # ============================================================
-# Slumdog Pythonair Agent 
+# Slumdog Pythonair Agent
 # ============================================================
 
 from typing import TypedDict
 from langgraph.graph import StateGraph, END
 from langchain_ollama.chat_models import ChatOllama
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import BaseMessage, HumanMessage, ToolMessage
+from langchain_core.tools import tool
 import requests
 import html
 import random
@@ -25,10 +26,12 @@ class TriviaState(TypedDict):
 
 
 # Create the LLM object here. We use Ollama
-llm = ChatOllama(model="llama3.2:1b", temperature=0.4)
+llm = ChatOllama(model="llama3.2:latest", temperature=0.4)
 
 
-# Nodes 
+# Nodes
+
+
 def setup_node(state: TriviaState) -> dict:
     print("\n Welcome to SlumDog Pythonair!")
     print("─" * 40)
@@ -42,7 +45,7 @@ def setup_node(state: TriviaState) -> dict:
         "difficulty": difficulty,
         "score": 0,
         "total_questions": 0,
-        "game_over": False
+        "game_over": False,
     }
 
 
@@ -63,64 +66,137 @@ def fetch_question_node(state: TriviaState) -> dict:
     random.shuffle(choices)
 
     # Return the state, with the correct answer
-    return {
-        "question": question,
-        "correct_answer": correct,
-        "choices": choices
-    }
+    return {"question": question, "correct_answer": correct, "choices": choices}
 
 
 def present_question_node(state: TriviaState) -> dict:
     # present the question to the user
     print(f"\nQuestion {state['total_questions'] + 1}:")
     print(f"  {state['question']}\n")
-    for i, choice in enumerate(state['choices'], 1):
+    for i, choice in enumerate(state["choices"], 1):
         print(f"  {i}. {choice}")
     # Request user input
     answer = input("\nYour answer (1–4, or 'q' to quit): ").strip()
 
     # In case the user want to exit
-    if answer.lower() == 'q':
+    if answer.lower() == "q":
         return {"game_over": True, "user_answer": ""}
 
     try:
-        selected = state['choices'][int(answer) - 1]
+        selected = state["choices"][int(answer) - 1]
         print(f"You selected: {selected}")
     except (ValueError, IndexError):
         print("Invalid input, marking as wrong.")
         selected = ""
     # Return the state for the next node
-    return {
-        "user_answer": selected,
-        "total_questions": state['total_questions'] + 1
-    }
+    return {"user_answer": selected, "total_questions": state["total_questions"] + 1}
+
+
+# Tools
+
+
+@tool
+def web_search(query: str) -> str:
+    """Search the web for extra detsils about a topic.
+
+    Uses DuckDuckGo API (no API key needed) and
+    returns a short text, or an empty string if nothing
+    useful was found.
+    """
+    try:
+        url = "https://api.duckduckgo.com/"
+        params = {"q": query, "format": "json", "no_html": "1", "skip_disambig": "1"}
+        response = requests.get(url, params=params, timeout=5)
+        data = response.json()
+    except (requests.RequestException, ValueError):
+        return ""
+
+    # Prefer the abstract
+    if data.get("AbstractText"):
+        return data["AbstractText"]
+
+    return ""
+
+
+# Here, we tell the model about the tool. The LLM itself decides whether
+# a call to web_search is needed to answer well. This is the actual agency
+tools = [web_search]
+tools_by_name = {t.name: t for t in tools}
+llm_with_tools = llm.bind_tools(tools)
+
+
+def normalize_query(args: dict, fallback: str) -> str:
+    """Fetch a clean query string out of a tool call's args."""
+    raw = args.get("query", "")
+    if isinstance(raw, dict):
+        raw = raw.get("value", "")
+    raw = str(raw).strip()
+    return raw or fallback
 
 
 def judge_node(state: TriviaState) -> dict:
     prompt = f"""
-    Using the following answers:
-    The trivia question was: {state['question']}
-    The correct answer is: {state['correct_answer']}
-    The player answered: {state['user_answer']}
+    You are the cheerful host of a trivia game. Here is this round:
 
-    tell the player in 1-2 sentences, if they got it right or wrong. Have the correct answer provided 
-    above as ground truth.
+    - Question:        {state['question']}
+    - Correct answer:  {state['correct_answer']}
+    - Player's answer: {state['user_answer']}
 
-    Be friendly and cheerful, replying directly to the player!
+    STEP 1 — Decide if the player is right.
+    The player is CORRECT only if their answer refers to the same thing as the
+    correct answer (ignore case and small wording differences).
 
-    In case you have any additional information rearding the question,
-    share some details, after telling the user the result.
+    STEP 2 — Reply directly to the player in 1-2 sentences:
+    - If the player is CORRECT: congratulate them warmly. Do NOT call any tool.
+    - If the player is WRONG: call the `web_search` tool exactly once, passing
+      the trivia question as the search query. Then tell them they were wrong
+      (roast them gracefully), reveal the correct answer, and add one
+      interesting detail from the search result.
+
+    Only call `web_search` when the player is WRONG.
     """
-    # Invoke the LLM
-    response = llm.invoke([HumanMessage(content=prompt)])
+
+    # these three lines essentially kill agency. BUT
+    # small models have the disadvantage of doing their thing :(
+    # So, i am putting a deterministic condition to avoid the call of tools when t
+    # there is no need.
+    is_correct = (
+        state["user_answer"].strip().lower() == state["correct_answer"].strip().lower()
+    )
+
+    # Ask the model, it can ask for a tool
+    messages: list[BaseMessage] = [HumanMessage(content=prompt)]
+    response = llm_with_tools.invoke(messages)
+
+    if not is_correct:
+        # Wrong answer:
+        if response.tool_calls:
+            messages.append(response)
+            for call in response.tool_calls:
+                selected_tool = tools_by_name[call["name"]]
+                query = normalize_query(
+                    call.get("args", {}), fallback=state["question"]
+                )
+                print(f"\n(searching the web for: {query})")
+                result = selected_tool.invoke({"query": query})
+                messages.append(
+                    ToolMessage(
+                        content=result or "No extra information found.",
+                        tool_call_id=call["id"],
+                    )
+                )
+            # Feed the tool results back so the model can finish its reply.
+            response = llm_with_tools.invoke(messages)
+    else:
+        # If the model tried to call a tool
+        # (and so returned no text), re-ask without tools for a clean message.
+        if response.tool_calls or not str(response.content).strip():
+            response = llm.invoke(messages)
+
     print(f"\n {response.content}")
 
-    # Update score
-    if state['user_answer'].strip().lower() == state['correct_answer'].strip().lower():
-        is_correct = True
-    else:
-        is_correct = False
-    new_score = state['score'] + (1 if is_correct else 0)
+    # Update score using the deterministic check above.
+    new_score = state["score"] + (1 if is_correct else 0)
 
     print(f"\n Score: {new_score} / {state['total_questions']}")
 
@@ -132,21 +208,21 @@ def judge_node(state: TriviaState) -> dict:
         game_over = False
     return {"score": new_score, "game_over": game_over}
 
+
 # Routing functions
 def route_after_judge(state: TriviaState) -> str:
-    # TODO #3 — SOLUTION
     if state["game_over"]:
         return "end"
     return "fetch_question"
 
 
 def route_after_present_question(state: TriviaState) -> str:
-    # THIS IS TO BE PASSED AS A BUG the user should solve
     if state["game_over"]:
         return "end"
     return "judge"
 
-# Graph 
+
+# Graph
 def build_graph():
     # Initiate the graph state
     graph = StateGraph(TriviaState)
@@ -163,20 +239,12 @@ def build_graph():
     graph.add_edge("fetch_question", "present_question")
 
     # two branches to correctly route the graph
-    graph.add_conditional_edges("present_question",
-                               route_after_present_question,
-                               {
-                                   "judge":"judge",
-                                   "end": END
-                               })
+    graph.add_conditional_edges(
+        "present_question", route_after_present_question, {"judge": "judge", "end": END}
+    )
 
     graph.add_conditional_edges(
-        "judge",
-        route_after_judge,
-        {
-            "fetch_question": "fetch_question",
-            "end": END
-        }
+        "judge", route_after_judge, {"fetch_question": "fetch_question", "end": END}
     )
     # Compile the graph
     return graph.compile()
@@ -199,4 +267,6 @@ if __name__ == "__main__":
     # Invocation of the graph
     final_state = app.invoke(initial_state)
     # Final result
-    print(f"\nGame over! Final score: {final_state['score']}/{final_state['total_questions']}")
+    print(
+        f"\nGame over! Final score: {final_state['score']}/{final_state['total_questions']}"
+    )
